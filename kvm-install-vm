@@ -59,10 +59,12 @@ function usage_subcommand ()
             printf "    -L          Location of VMs       (default: $HOME/virt/vms)\n"
             printf "    -m          Memory Size (MB)      (default: 1024)\n"
             printf "    -M          Mac address           (default: auto-assigned)\n"
+            printf "    -n          LibVirt Network       (default: Use bridge)\n"
             printf "    -p          Console port          (default: auto)\n"
+            printf "    -P          Default user password (default: none; password disabled)\n"
             printf "    -s          Custom shell script\n"
             printf "    -t          Linux Distribution    (default: centos7)\n"
-            printf "    -T          Timezone              (default: US/Eastern)\n"
+            printf "    -T          Timezone              (default: UTC)\n"
             printf "    -u          Custom user           (default: $USER)\n"
             printf "    -y          Assume yes to prompts (default: false)\n"
             printf "    -n          Assume no to prompts  (default: false)\n"
@@ -71,6 +73,7 @@ function usage_subcommand ()
             printf "DISTRIBUTIONS\n"
             printf "    NAME            DESCRIPTION                         LOGIN\n"
             printf "    amazon2         Amazon Linux 2                      ec2-user\n"
+            printf "    centos8         CentOS 8                            centos\n"
             printf "    centos7         CentOS 7                            centos\n"
             printf "    centos7-atomic  CentOS 7 Atomic Host                centos\n"
             printf "    centos6         CentOS 6                            centos\n"
@@ -293,6 +296,14 @@ function fetch_images ()
             DISK_FORMAT=qcow2
             LOGIN_USER=ec2-user
             ;;
+        centos8)
+            QCOW=""
+            OS_TYPE="linux"
+            OS_VARIANT="centos8.0"
+            IMAGE_URL=https://cloud.centos.org/centos/8/images
+            DISK_FORMAT=qcow2
+            LOGIN_USER=centos
+            ;;
         centos7)
             QCOW=CentOS-7-x86_64-GenericCloud.qcow2
             OS_TYPE="linux"
@@ -442,6 +453,23 @@ function storpool_exists ()
         || STORPOOL_EXISTS=0
 }
 
+function network_exists ()
+{
+    virsh net-info "${1}" > /dev/null 2>&1 \
+        && NETWORK_EXISTS=1 \
+        || NETWORK_EXISTS=0
+}
+
+function vol_exists_in_pool
+{
+    POOL="${1}"
+    VOL="${2}"
+
+    virsh vol-key "${VOL}" "${POOL}" > /dev/null 2>&1 \
+        && VOL_EXISTS=1 \
+        || VOL_EXISTS=0
+}
+
 function set_sudo_group ()
 {
     case "${DISTRO}" in
@@ -506,6 +534,14 @@ function create_vm ()
     # Create log file
     touch ${VMNAME}.log
 
+    # Generate password
+    if [[ ! -z "${PASSWD}" ]]
+    then
+        PASSWORD="lock-passwd: False"$'\n'"      passwd: $(python -c "import crypt; print(crypt.crypt('${PASSWD}'))")"
+    fi
+
+    unset PASSWD
+
     # cloud-init config: set hostname, remove cloud-init package,
     # and add ssh-key
     cat > $USER_DATA << _EOF_
@@ -525,6 +561,7 @@ fqdn: ${VMNAME}.${DNSDOMAIN}
 users:
     - default
     - name: ${ADDITIONAL_USER}
+      ${PASSWORD}
       groups: ['${SUDOGROUP}']
       shell: /bin/bash
       sudo: ALL=(ALL) NOPASSWD:ALL
@@ -567,6 +604,10 @@ _EOF_
 
 --==BOUNDARY==--
 _EOF_
+    unset PASSWORD
+
+    cat ${USER_DATA} >> ${VMNAME}.log
+
     fi
 
     { echo "instance-id: ${VMNAME}"; echo "local-hostname: ${VMNAME}"; } > $META_DATA
@@ -617,12 +658,22 @@ _EOF_
         --target=${VMDIR}/${VMNAME} \
         || die "Could not create storage pool."
 
-    # Add custom MAC Address if specified
-    NETWORK_PARAMS="$(join ',' \
-        $(param bridge ${BRIDGE}) \
-        $(param model ${NETWORK_MODEL}) \
-        $(param mac ${MACADDRESS}) \
-        ${NETWORK_EXTRA})"
+    if [[ "$NETWORK" == "" ]];
+    then
+        # Add custom MAC Address if specified
+        NETWORK_PARAMS="$(join ',' \
+            $(param bridge ${BRIDGE}) \
+            $(param model ${NETWORK_MODEL}) \
+            $(param mac ${MACADDRESS}) \
+            ${NETWORK_EXTRA})"
+    else
+        # Add custom MAC Address if specified
+        NETWORK_PARAMS="$(join ',' \
+            $(param network ${NETWORK}) \
+            $(param model ${NETWORK_MODEL}) \
+            $(param mac ${MACADDRESS}) \
+            ${NETWORK_EXTRA})"
+    fi
 
     # Assemble disk parameters.
     DISK_PARAMS="$(join ',' \
@@ -638,9 +689,12 @@ _EOF_
         ${CI_ISO_EXTRA})"
 
     # Omit the --graphics option to auto-detect.
-    if [ "${GRAPHICS}" = 'auto' ]
+    if [ "${GRAPHICS}" = 'auto'  ]
     then
         GRAPHICS_PARAMS=""
+    elif [ "${GRAPHICS}" = 'none' ]
+    then
+        GRAPHICS_PARAMS="none"
     else
         GRAPHICS_PARAMS="$(join ',' \
             ${GRAPHICS} \
@@ -716,13 +770,23 @@ _EOF_
 
     printf "\n"
     output "SSH to ${VMNAME}: 'ssh ${LOGIN_USER}@${IP}' or 'ssh ${LOGIN_USER}@${VMNAME}'"
-    CONSOLE=$(virsh domdisplay ${VMNAME})
+    
+    if [ "${GRAPHICS}" = 'none' ]
+    then
+        virsh console ${VMNAME}
+    else
+        CONSOLE=$(virsh domdisplay ${VMNAME})
+    fi
+
     # Workaround because VNC port number shown by virsh domdisplay is offset from 5900
     if [ "${GRAPHICS}" = 'vnc' ]
     then
         CONSOLE_NO_PORT=$(echo $CONSOLE | cut -d ':' -f 1,2 -)
         CONSOLE_PORT=$(expr 5900 + $(echo $CONSOLE | cut -d ':' -f 3 -))
         output "Console at ${CONSOLE_NO_PORT}:${CONSOLE_PORT}"
+    elif [ "${GRAPHICS}" = 'none' ]
+    then
+        output "Console at 'virsh console ${VMNAME}'"
     else
         output "Console at ${CONSOLE}"
     fi
@@ -769,16 +833,18 @@ function set_defaults ()
     MEMORY=1024                     # Amount of RAM in MB
     DISK_SIZE=""                    # Disk Size in GB
     DNSDOMAIN=example.local         # DNS domain
-    GRAPHICS=spice                  # Graphics type or "auto"
+    GRAPHICS=none                   # Graphics type, "none", or "auto"
     RESIZE_DISK=false               # Resize disk (boolean)
     IMAGEDIR=${HOME}/virt/images    # Directory to store images
     VMDIR=${HOME}/virt/vms          # Directory to store virtual machines
     BRIDGE=virbr0                   # Hypervisor bridge
+    NETWORK=default                 # LibVirt network name
     PUBKEY=""                       # SSH public key
     DISTRO=centos7                  # Distribution
     MACADDRESS=""                   # MAC Address
     PORT=-1                         # Console port
-    TIMEZONE=US/Eastern             # Timezone
+    PASSWD=""                       # Default default user password (disabled)
+    TIMEZONE=UTC                    # Timezone
     ADDITIONAL_USER=${USER}         # User
     ASSUME_YES=0                    # Assume yes to prompts
     ASSUME_NO=0                     # Assume no to prompts
@@ -811,7 +877,7 @@ function set_custom_defaults ()
 function create ()
 {
     # Parse command line arguments
-    while getopts ":b:c:d:D:f:g:i:k:l:L:m:M:p:s:t:T:u:ahynv" opt
+    while getopts ":b:c:d:D:f:g:i:k:l:L:m:M:n:p:P:s:t:T:u:ahynv" opt
     do
         case "$opt" in
             a ) AUTOSTART=${OPTARG} ;;
@@ -827,7 +893,9 @@ function create ()
             L ) VMDIR="${OPTARG}" ;;
             m ) MEMORY="${OPTARG}" ;;
             M ) MACADDRESS="${OPTARG}" ;;
+            n ) NETWORK="${OPTARG}" ;;
             p ) PORT="${OPTARG}" ;;
+            P ) PASSWD="${OPTARG}" ;;
             s ) SCRIPTNAME="${OPTARG}" ;;
             t ) DISTRO="${OPTARG}" ;;
             T ) TIMEZONE="${OPTARG}" ;;
